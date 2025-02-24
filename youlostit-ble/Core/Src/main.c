@@ -18,10 +18,38 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
+
+
+
+
+
+
+// this code combines our original main with the given main
+
+
+
+
+
 //#include "ble_commands.h"
 #include "ble.h"
-
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+
+/* Include memory map of our MCU */
+#include <stm32l475xx.h>
+
+/* Include LED driver */
+#include "leds.h"
+
+/* Include timer driver */
+#include "timer.h"
+
+/* Include i2c driver */
+#include "i2c.h"
+
+/* Include lsm6dsl driver */
+#include "lsm6dsl.h"
 
 int dataAvailable = 0;
 
@@ -30,46 +58,150 @@ SPI_HandleTypeDef hspi3;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_SPI3_Init(void);
+/*added an error handler*/
+void Error_Handler(void);
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
+// Redefine the libc _write() function so you can use printf in your code
+int _write(int file, char *ptr, int len) {
+	int i = 0;
+	for (i = 0; i < len; i++) {
+		ITM_SendChar(*ptr++);
+	}
+	return len;
+}
+
+//this should be our ID
+#define STUDENT_ID 0x721   // 3103 16-bit student ID
+#define PREAMBLE 0x99       // 8-bit preamble (10011001 in binary)
+#define LSM6DSL_ADDR 0x6A
+#define WHO_AM_I_REG 0x0F
+
+// Transmission state
+volatile uint16_t data_to_transmit = PREAMBLE;
+volatile uint16_t pid = 0x721;
+volatile uint8_t bit_index = 0;
+volatile int8_t bit_pre = 3;
+volatile int8_t bit_post = 7;
+volatile int16_t min_counter = 1200 - 1;
+volatile int16_t curr_counter = 0;
+volatile uint8_t minutes_lost = 0;
+
+enum state {FOUND, LOST};
+enum state currentState = FOUND;
+
+uint8_t bitPatterns[16] = {1, 2, 1, 2, 0, 0, 1, 3, 0, 2, 0, 1};
+
+int16_t x_prev = 0, y_prev = 0, z_prev = 0;
+
+int isMoving() {
+    int16_t x, y, z;
+    lsm6dsl_read_xyz(&x, &y, &z);
+
+    int16_t x_diff = abs(x - x_prev);
+    int16_t y_diff = abs(y - y_prev);
+    int16_t z_diff = abs(z - z_prev);
+
+    x_prev = x;
+    y_prev = y;
+    z_prev = z;
+
+    return ((x_diff > 500) || (y_diff > 500) || (z_diff > 500));
+}
+
+void handleState() {
+    switch (currentState) {
+        case FOUND:
+            leds_set(0);
+            if (minutes_lost > 0 && !isMoving()) {
+                currentState = LOST;
+            }
+            break;
+
+        case LOST:
+            bitPatterns[12] = (minutes_lost & 0xC0) >> 6;
+            bitPatterns[13] = (minutes_lost & 0x30) >> 4;
+            bitPatterns[14] = (minutes_lost & 0x0C) >> 2;
+            bitPatterns[15] = minutes_lost & 0x03;
+            leds_set(bitPatterns[bit_index]);
+
+            if (isMoving()) {
+                curr_counter = 0;
+                minutes_lost = 0;
+                currentState = FOUND;
+            }
+            break;
+    }
+}
+
+void TIM2_IRQHandler(void) {
+    if (TIM2->SR & TIM_SR_UIF) {
+        if (currentState == LOST) {
+            if (bit_index >= 15) {
+                bit_index = 0;
+                minutes_lost++;
+            } else {
+                bit_index++;
+            }
+        } else {
+            curr_counter++;
+            if (curr_counter >= min_counter) {
+                minutes_lost++;
+                curr_counter = 0;
+            }
+        }
+
+        TIM2->SR &= ~TIM_SR_UIF;
+        timer_reset(TIM2);
+    }
+}
+
 int main(void)
 {
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  /* Initialize HAL (Hardware Abstraction Layer) */
   HAL_Init();
 
-  /* Configure the system clock */
+  /* Configure system clock */
   SystemClock_Config();
 
-  /* Initialize all configured peripherals */
+  /* Initialize GPIO and SPI */
   MX_GPIO_Init();
   MX_SPI3_Init();
 
-  //RESET BLE MODULE
-  HAL_GPIO_WritePin(BLE_RESET_GPIO_Port,BLE_RESET_Pin,GPIO_PIN_RESET);
+  // ** Reset BLE Module **
+  HAL_GPIO_WritePin(BLE_RESET_GPIO_Port, BLE_RESET_Pin, GPIO_PIN_RESET);
   HAL_Delay(10);
-  HAL_GPIO_WritePin(BLE_RESET_GPIO_Port,BLE_RESET_Pin,GPIO_PIN_SET);
-
-  ble_init();
-
+  HAL_GPIO_WritePin(BLE_RESET_GPIO_Port, BLE_RESET_Pin, GPIO_PIN_SET);
+  ble_init();  // Initialize BLE
   HAL_Delay(10);
 
-  uint8_t nonDiscoverable = 0;
+  // ** Initialize Sensors and Peripherals **
+  i2c_init();
+  lsm6dsl_init();  // Initialize accelerometer
+  leds_init();
+  timer_init(TIM2);
+  timer_set_ms(TIM2, 1000);  // Set timer to trigger every 1 second
 
+  uint8_t nonDiscoverable = 0;  // Flag to indicate if BLE should be hidden
+
+  /* Main Loop */
   while (1)
   {
-	  if(!nonDiscoverable && HAL_GPIO_ReadPin(BLE_INT_GPIO_Port,BLE_INT_Pin)){
-	    catchBLE();
-	  }else{
-		  HAL_Delay(1000);
-		  // Send a string to the NORDIC UART service, remember to not include the newline
-		  unsigned char test_str[] = "youlostit BLE test";
-		  updateCharValue(NORDIC_UART_SERVICE_HANDLE, READ_CHAR_HANDLE, 0, sizeof(test_str)-1, test_str);
-	  }
-	  // Wait for interrupt, only uncomment if low power is needed
-	  //__WFI();
+      handleState();  // Check movement and update lost mode status
+
+      if (!nonDiscoverable && HAL_GPIO_ReadPin(BLE_INT_GPIO_Port, BLE_INT_Pin)) {
+          catchBLE();  // Handle BLE interrupt if connected
+      } else {
+          HAL_Delay(1000);  // Wait 1 second before sending next BLE update
+
+          // ** Notify the BLE app when the object is lost **
+          if (lostMode) {
+              unsigned char test_str[] = "youlostit BLE test";
+              updateCharValue(NORDIC_UART_SERVICE_HANDLE, READ_CHAR_HANDLE, 0, sizeof(test_str)-1, test_str);
+          }
+      }
+
+      // ** Uncomment if low power mode is needed **
+      // __WFI();  // Wait for interrupt
   }
 }
 
