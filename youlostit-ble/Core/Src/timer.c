@@ -38,17 +38,19 @@ void timer_reset(TIM_TypeDef* timer){
 	timer->CNT = 0;
 }
 
-void timer_set_ms(TIM_TypeDef* timer, uint16_t period_ms){
-	// TODO implement this
-	//Timer clock frequency is 4 MHz (default after reset)
-	uint32_t timer_clock_frequency = 4000000; // 4 MHz
+void timer_set_ms(TIM_TypeDef* timer, uint16_t period_ms)
+{
+		// TODO implement this
+		// Step 1: Calculate the timer's frequency based on the system clock
+	    uint32_t system_clock = 8000000;  // Assuming system clock is 4 MHz (adjust based on actual clock)
 
-	//Set the period that the timer will fire (in milliseconds).
-	uint32_t period = period_ms;
-	uint32_t prescalar = (timer_clock_frequency/1000) - 1;
+	    // Step 2: Determine the prescaler value and the period for milliseconds
+	    uint32_t prescaler = (system_clock / 1000) - 1;  // To get 1 ms ticks
+	    uint32_t period = period_ms;  // Period in milliseconds
 
-	//A timer interrupt should be fired for each timer period.
-	timer->PSC = prescalar;  // set calculated prescalar to timer prescalar
-	timer->ARR = period - 1;  //set calculated period to tick time amount
+	    // Step 3: Set the prescaler and auto-reload register for the timer
+	    timer->PSC = prescaler;  // Set the prescaler to divide the clock
+	    timer->ARR = period - 1; // Set the period value for how many ticks it should wait
 
+	    // Step 4: Enable the timer (done in the initialization)
 }
